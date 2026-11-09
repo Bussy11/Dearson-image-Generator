@@ -1,0 +1,10 @@
+streamlit>=1.40
+requests
+Pillow
+numpy
+imageio
+imageio-ffmpeg
+edge-tts
+gTTS
+gradio_client
+huggingface_hub
