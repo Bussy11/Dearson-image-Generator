@@ -197,11 +197,118 @@ def make_video(img_bytes: bytes, effect: str, seconds: int, fps: int, size: tupl
     return data
 
 
-def ai_motion_video(img_bytes: bytes, token: str) -> bytes:
-    """Optional experimental AI motion through Hugging Face (needs token)."""
-    from huggingface_hub import InferenceClient
+# ---- Real AI motion (people actually move) via free LTX-Video Space on Hugging Face ----
+LTX_SPACE = "Lightricks/ltx-video-distilled"
+LTX_SIZES = {"Landscape 16:9": (704, 512), "Portrait 9:16": (512, 704), "Square 1:1": (640, 640)}
+CINEMA = ("cinematic lighting, natural realistic human movement, lifelike faces and expressions, "
+          "smooth stable camera, shallow depth of field, warm film color grading, 35mm film look, high detail")
+NEG = "worst quality, blurry, jittery, distorted faces, deformed hands, extra limbs, inconsistent motion, morphing, text, watermark"
+DEFAULT_SCENE = "The people in the scene come alive, smiling, breathing and moving naturally"
 
-    return InferenceClient(token=token).image_to_video(img_bytes)
+
+@st.cache_resource(ttl=3000, show_spinner=False)
+def get_client(space: str, token: str):
+    from gradio_client import Client
+
+    if token:
+        try:
+            return Client(space, hf_token=token)
+        except TypeError:
+            return Client(space, token=token)
+    return Client(space)
+
+
+def ltx_clip(img_bytes: bytes, prompt: str, seconds: float, size: tuple, token: str, space: str) -> bytes:
+    """One AI clip from one image. People really move, smile, dance (prompt-driven)."""
+    from gradio_client import handle_file
+
+    W, H = size
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    tmp.write(img_bytes)
+    tmp.close()
+    client = get_client(space, token)
+    try:
+        try:
+            res = client.predict(
+                prompt=prompt, negative_prompt=NEG, input_image_filepath=handle_file(tmp.name),
+                height_ui=H, width_ui=W, mode="image-to-video", duration_ui=float(seconds),
+                api_name="/image_to_video",
+            )
+        except Exception as e1:  # noqa: BLE001
+            if any(k in str(e1).lower() for k in ("quota", "gpu", "queue", "exceeded")):
+                raise
+            res = client.predict(
+                prompt, NEG, handle_file(tmp.name), None, H, W, "image-to-video",
+                float(seconds), 9, 42, True, 1.0, True, api_name="/image_to_video",
+            )
+    finally:
+        os.remove(tmp.name)
+    out = res[0] if isinstance(res, (list, tuple)) else res
+    for _ in range(2):
+        if isinstance(out, dict):
+            out = out.get("video") or out.get("path") or out
+    if not isinstance(out, str):
+        raise RuntimeError("The video Space returned no video.")
+    with open(out, "rb") as f:
+        return f.read()
+
+
+def last_frame(video_bytes: bytes) -> bytes:
+    """Last frame of a clip: used so the next scene continues from where this one ended."""
+    import imageio.v2 as imageio
+    from PIL import Image
+
+    p = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    p.write(video_bytes)
+    p.close()
+    last = None
+    reader = imageio.get_reader(p.name)
+    for fr in reader:
+        last = fr
+    reader.close()
+    os.remove(p.name)
+    buf = io.BytesIO()
+    Image.fromarray(last).save(buf, "JPEG", quality=92)
+    return buf.getvalue()
+
+
+def join_clips(clips: list) -> bytes:
+    """Stitch scenes into one video."""
+    if len(clips) == 1:
+        return clips[0]
+    import imageio.v2 as imageio
+    import numpy as np
+    from PIL import Image
+
+    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+    writer = imageio.get_writer(out_path, fps=30, codec="libx264", pixelformat="yuv420p", macro_block_size=1)
+    size = None
+    for c in clips:
+        p = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        p.write(c)
+        p.close()
+        reader = imageio.get_reader(p.name)
+        for fr in reader:
+            if size is None:
+                size = (fr.shape[1], fr.shape[0])
+            if (fr.shape[1], fr.shape[0]) != size:
+                fr = np.asarray(Image.fromarray(fr).resize(size))
+            writer.append_data(fr)
+        reader.close()
+        os.remove(p.name)
+    writer.close()
+    with open(out_path, "rb") as f:
+        data = f.read()
+    os.remove(out_path)
+    return data
+
+
+def friendly_error(e: Exception) -> str:
+    msg = str(e)
+    if any(k in msg.lower() for k in ("quota", "exceeded", "gpu")):
+        return ("The free GPU time is used up right now. Paste a free Hugging Face token under "
+                "⚙️ Settings (your own daily quota is used), or try again in a few hours.")
+    return msg
 
 
 # ----------------------------------------------------------------------------
@@ -295,7 +402,7 @@ page = st.radio(
 
 with st.expander("⚙️ Settings (optional Hugging Face token)"):
     hf_token = st.text_input(
-        "Hugging Face token (optional: backup image engine, AI motion, extra reliability)",
+        "Hugging Face token (free; strongly recommended for AI video, gives you your own GPU quota)",
         type="password",
         value=os.environ.get("HF_TOKEN", ""),
     )
@@ -372,16 +479,27 @@ elif page.startswith("🎬"):
     if ss.vid_src:
         st.image(ss.vid_src, caption="Source image", use_container_width=True)
 
-        c1, c2, c3, c4 = st.columns(4)
-        effect = c1.selectbox("Motion", EFFECTS)
-        secs = c2.slider("Secs", 3, 12, 6)
-        fps = c3.selectbox("FPS", [12, 18, 24], index=1)
-        vsize = c4.selectbox("Shape", list(VIDEO_SIZES))
-        use_ai = st.checkbox("Try AI motion first (needs Hugging Face token, may be slow)", value=False)
+        c1, c2, c3 = st.columns(3)
+        engine = c1.selectbox("Engine", ["AI human motion", "Simple zoom/pan"])
+        vsize = c2.selectbox("Shape", list(LTX_SIZES))
+        secs = c3.slider("Secs/scene", 2, 8, 5)
+        if engine == "Simple zoom/pan":
+            m1, m2 = st.columns(2)
+            effect = m1.selectbox("Motion", EFFECTS)
+            fps = m2.selectbox("FPS", [12, 18, 24], index=1)
 
-        st.markdown("**💬 Describe the new image you want instead (optional)**")
+        story = st.text_area(
+            "🎬 What should happen? One line = one scene (max 4)",
+            key="vid_story", height=140,
+            placeholder="The couple smiles and sings, guests clap and cheer\n"
+                        "The couple starts to dance happily\n"
+                        "The pastor walks in quickly and joins the celebration",
+        )
+        cinematic = st.checkbox("🎞 Cinematic look", value=True)
+
+        st.markdown("**🖼 Want a different picture first? Describe it:**")
         vcomment = st.text_area("vc", key="vid_comment", height=70, label_visibility="collapsed",
-                                placeholder="Same scene but at night with glowing lights")
+                                placeholder="Same wedding scene but at night with glowing lights")
 
         v1, v2, v3 = st.columns(3)
         make = v1.button("🎬 Make video", key="mkvid")
@@ -406,19 +524,33 @@ elif page.startswith("🎬"):
                 st.warning("Describe the new image first.")
 
         if make:
-            with st.spinner("Rendering video..."):
-                try:
-                    out = None
-                    if use_ai and hf_token:
-                        try:
-                            out = ai_motion_video(ss.vid_src, hf_token)
-                        except Exception:  # noqa: BLE001
-                            st.info("AI motion unavailable right now, using the built-in engine.")
-                    if out is None:
-                        out = make_video(ss.vid_src, effect, secs, fps, VIDEO_SIZES[vsize])
-                    ss.vid_out = out
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"Video failed: {e}")
+            ss.vid_out = None
+            if engine == "Simple zoom/pan":
+                with st.spinner("Rendering video..."):
+                    try:
+                        ss.vid_out = make_video(ss.vid_src, effect, secs, fps, VIDEO_SIZES[vsize])
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"Video failed: {e}")
+            else:
+                scenes = [s.strip() for s in story.splitlines() if s.strip()][:4] or [DEFAULT_SCENE]
+                clips, current = [], ss.vid_src
+                with st.status("Creating your AI video (about 1 minute per scene)...", expanded=True) as status:
+                    try:
+                        for i, scene in enumerate(scenes, 1):
+                            st.write(f"🎬 Scene {i}/{len(scenes)}: {scene}")
+                            prompt = scene + (". " + CINEMA if cinematic else "")
+                            clip = ltx_clip(current, prompt, secs, LTX_SIZES[vsize], hf_token, LTX_SPACE)
+                            clips.append(clip)
+                            if i < len(scenes):
+                                current = last_frame(clip)
+                        ss.vid_out = join_clips(clips)
+                        status.update(label="Video ready!", state="complete")
+                    except Exception as e:  # noqa: BLE001
+                        status.update(label="Video stopped", state="error")
+                        st.error(friendly_error(e))
+                        if clips:
+                            ss.vid_out = join_clips(clips)
+                            st.warning(f"Showing the {len(clips)} scene(s) that finished.")
 
         if ss.vid_out:
             st.video(ss.vid_out)
