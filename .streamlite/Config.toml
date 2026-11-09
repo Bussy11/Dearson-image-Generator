@@ -1,0 +1,14 @@
+[server]
+fileWatcherType = "none"
+runOnSave = false
+enableXsrfProtection = true
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+[runner]
+fastReruns = true
