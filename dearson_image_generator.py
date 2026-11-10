@@ -2,17 +2,22 @@
 DEARson Image Generator
 -----------------------
 Pages:
-  1. Image Generator  - text -> image (free, no API key: Pollinations.ai)
-  2. Image to Video   - upload (or generate) an image -> MP4 (runs locally, always works)
+  1. Image Generator  - text -> image (free Pollinations, or ChatGPT / Gemini with your own API key)
+  2. Image to Video   - image + description -> walking, talking human video
+                        (free AI walk + lip-sync, or Gemini Veo with your own key)
   3. Text to Audio    - free TTS (Edge voices / gTTS) + voice-cloning buttons
 
 Run:  streamlit run dearson_image_generator.py
 """
 import asyncio
+import base64
 import io
 import os
 import random
+import re
+import subprocess
 import tempfile
+import time
 from urllib.parse import quote
 
 import requests
@@ -42,6 +47,9 @@ BUTTON_COLORS = {
     "clone": "linear-gradient(135deg,#f953c6,#b91d73)",
     "speakclone": "linear-gradient(135deg,#fc4a1a,#f7b733)",
     "clearclone": "linear-gradient(135deg,#434343,#000000)",
+    "pitchdn": "linear-gradient(135deg,#1d976c,#93f9b9)",
+    "pitchreset": "linear-gradient(135deg,#434343,#000000)",
+    "pitchup": "linear-gradient(135deg,#ee0979,#ff6a00)",
 }
 
 _css_btns = "\n".join(
@@ -129,6 +137,77 @@ def fetch_image(prompt: str, w: int, h: int, seed: int, model: str, hf_token: st
     raise RuntimeError(f"Image generation failed: {last_err}")
 
 
+# ---- Premium image engines: ChatGPT (OpenAI) and Gemini (Google). They need YOUR API key. ----
+IMG_PROVIDERS = {
+    "🆓 Free (Pollinations)": "free",
+    "🤖 ChatGPT (OpenAI key)": "openai",
+    "💎 Gemini (Google key)": "gemini",
+}
+PROVIDER_NOTES = {
+    "free": "Free, no key. Fine for drafts; human faces can look less real.",
+    "openai": "Best realism for people. Paid per image and needs an OpenAI API key "
+              "(a ChatGPT subscription alone does not include API access).",
+    "gemini": "Very good people images. Needs a Google AI Studio API key; "
+              "Google may require billing for image models.",
+}
+OPENAI_SIZES = {"Square 1:1": "1024x1024", "Portrait 9:16": "1024x1536", "Landscape 16:9": "1536x1024"}
+GEMINI_RATIOS = {"Square 1:1": "1:1", "Portrait 9:16": "9:16", "Landscape 16:9": "16:9"}
+PEOPLE_MODES = {
+    "Off": "",
+    "Realistic person": ", photorealistic real person, natural skin texture, realistic proportions, "
+                        "detailed face and hands, professional photography, sharp focus",
+    "Full body (for walking video)": ", full body shot from head to toe, standing upright, whole outfit and shoes "
+                                     "visible, photorealistic real person, natural skin texture, realistic proportions, "
+                                     "detailed face and hands, plain simple background, professional fashion photography",
+}
+
+
+def openai_image(prompt: str, size: str, key: str, model: str) -> bytes:
+    r = requests.post(
+        "https://api.openai.com/v1/images/generations",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "prompt": prompt, "size": size, "n": 1},
+        timeout=240,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"ChatGPT (OpenAI) error {r.status_code}: {r.text[:300]}")
+    item = r.json()["data"][0]
+    if item.get("b64_json"):
+        return base64.b64decode(item["b64_json"])
+    return requests.get(item["url"], timeout=120).content
+
+
+def gemini_image(prompt: str, ratio: str, key: str, model: str) -> bytes:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"], "imageConfig": {"aspectRatio": ratio}},
+    }
+    r = requests.post(url, headers=headers, json=body, timeout=240)
+    if r.status_code == 400:  # some models reject imageConfig: retry without it
+        body["generationConfig"].pop("imageConfig", None)
+        r = requests.post(url, headers=headers, json=body, timeout=240)
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini error {r.status_code}: {r.text[:300]}")
+    for cand in r.json().get("candidates", []):
+        for part in cand.get("content", {}).get("parts", []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                return base64.b64decode(inline["data"])
+    raise RuntimeError("Gemini returned no image (the prompt may have been blocked). Try different words.")
+
+
+@st.cache_data(ttl=3600, max_entries=40, show_spinner=False)
+def generate_image(provider: str, prompt: str, w: int, h: int, seed: int, size_name: str, pol_model: str,
+                   hf_token: str, openai_key: str, openai_model: str, gemini_key: str, gemini_model: str) -> bytes:
+    if provider == "openai":
+        return openai_image(prompt, OPENAI_SIZES[size_name], openai_key, openai_model)
+    if provider == "gemini":
+        return gemini_image(prompt, GEMINI_RATIOS[size_name], gemini_key, gemini_model)
+    return fetch_image(prompt, w, h, seed, pol_model, hf_token)
+
+
 def shrink(img_bytes: bytes, max_side: int = 1280) -> bytes:
     """Downscale big phone photos so everything runs faster."""
     from PIL import Image
@@ -200,10 +279,26 @@ def make_video(img_bytes: bytes, effect: str, seconds: int, fps: int, size: tupl
 # ---- Real AI motion (people actually move) via free LTX-Video Space on Hugging Face ----
 LTX_SPACE = "Lightricks/ltx-video-distilled"
 LTX_SIZES = {"Landscape 16:9": (704, 512), "Portrait 9:16": (512, 704), "Square 1:1": (640, 640)}
-CINEMA = ("cinematic lighting, natural realistic human movement, lifelike faces and expressions, "
-          "smooth stable camera, shallow depth of field, warm film color grading, 35mm film look, high detail")
-NEG = "worst quality, blurry, jittery, distorted faces, deformed hands, extra limbs, inconsistent motion, morphing, text, watermark"
-DEFAULT_SCENE = "The people in the scene come alive, smiling, breathing and moving naturally"
+CINEMA = ("cinematic lighting, shallow depth of field, warm film color grading, high detail")
+NEG = ("worst quality, blurry, jittery, distorted face, deformed hands, extra limbs, extra legs, morphing, "
+       "frozen, static pose, slideshow, sliding picture, zoom only, stiff mannequin, feet gliding, text, watermark")
+DEFAULT_SCENE = "The person comes alive, breathing, blinking and moving naturally"
+WALK_WORDS = ("walk", "catwalk", "stride", "strut", "runway", "stroll", "step", "pace")
+WALK_DETAIL = ("The person takes real steps: legs alternate, feet land naturally, hips sway, arms swing, "
+               "torso and shoulders turn, hair and clothes move with every step and weight shifts from foot to foot. "
+               "The camera tracks smoothly at eye level.")
+
+
+def motion_prompt(scene: str, cinematic: bool) -> str:
+    """Turn the user's one-line description into a detailed, action-first video prompt."""
+    s = scene.strip().rstrip(".")
+    parts = [s + "."]
+    if any(w in s.lower() for w in WALK_WORDS):
+        parts.append(WALK_DETAIL)
+    parts.append("Real human motion with natural body movement, lifelike face and expressions, smooth stable camera.")
+    if cinematic:
+        parts.append(CINEMA + ".")
+    return " ".join(parts)
 
 
 @st.cache_resource(ttl=3000, show_spinner=False)
@@ -272,35 +367,66 @@ def last_frame(video_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
+def _ff() -> str:
+    import imageio_ffmpeg
+
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _run(cmd: list) -> None:
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("Video tool error: " + r.stderr[-300:])
+
+
+def _probe(path: str) -> str:
+    return subprocess.run([_ff(), "-i", path], capture_output=True, text=True).stderr
+
+
+def _has_audio(path: str) -> bool:
+    return "Audio:" in _probe(path)
+
+
+def _video_size(path: str):
+    m = re.search(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})[\s,\[]", _probe(path))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def join_clips(clips: list) -> bytes:
-    """Stitch scenes into one video."""
+    """Stitch scenes into one video and KEEP the voice (silent clips get a silent track)."""
     if len(clips) == 1:
         return clips[0]
-    import imageio.v2 as imageio
-    import numpy as np
-    from PIL import Image
-
-    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-    writer = imageio.get_writer(out_path, fps=30, codec="libx264", pixelformat="yuv420p", macro_block_size=1)
-    size = None
-    for c in clips:
-        p = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-        p.write(c)
-        p.close()
-        reader = imageio.get_reader(p.name)
-        for fr in reader:
-            if size is None:
-                size = (fr.shape[1], fr.shape[0])
-            if (fr.shape[1], fr.shape[0]) != size:
-                fr = np.asarray(Image.fromarray(fr).resize(size))
-            writer.append_data(fr)
-        reader.close()
-        os.remove(p.name)
-    writer.close()
-    with open(out_path, "rb") as f:
-        data = f.read()
-    os.remove(out_path)
-    return data
+    tmp = tempfile.mkdtemp()
+    paths = []
+    for i, c in enumerate(clips):
+        p = os.path.join(tmp, f"in{i}.mp4")
+        with open(p, "wb") as f:
+            f.write(c)
+        paths.append(p)
+    W, H = _video_size(paths[0]) or (640, 640)
+    W, H = W - W % 2, H - H % 2
+    vf = (f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+          f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps=24,setsar=1,format=yuv420p")
+    ff = _ff()
+    norm = []
+    for i, p in enumerate(paths):
+        o = os.path.join(tmp, f"n{i}.mp4")
+        if _has_audio(p):
+            cmd = [ff, "-y", "-i", p, "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                   "-c:a", "aac", "-ar", "44100", "-ac", "2", o]
+        else:
+            cmd = [ff, "-y", "-i", p, "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-shortest",
+                   "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                   "-c:a", "aac", "-ar", "44100", "-ac", "2", o]
+        _run(cmd)
+        norm.append(o)
+    lst = os.path.join(tmp, "list.txt")
+    with open(lst, "w") as f:
+        f.write("".join(f"file '{p}'\n" for p in norm))
+    out = os.path.join(tmp, "out.mp4")
+    _run([ff, "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", out])
+    with open(out, "rb") as f:
+        return f.read()
 
 
 def friendly_error(e: Exception) -> str:
@@ -309,6 +435,156 @@ def friendly_error(e: Exception) -> str:
         return ("The free GPU time is used up right now. Paste a free Hugging Face token under "
                 "⚙️ Settings (your own daily quota is used), or try again in a few hours.")
     return msg
+
+
+# ----------------------------------------------------------------------------
+# TALKING (lip-sync) + GEMINI VEO
+# ----------------------------------------------------------------------------
+LIPSYNC_SPACE = "pragnakalp/Wav2lip-ZeroGPU"  # free public Space: image + voice -> mouth moves
+
+
+def crop_face(img_bytes: bytes, out_size: tuple) -> bytes:
+    """Crop head-and-shoulders (same shape as the video) so the mouth is big enough to lip-sync."""
+    import numpy as np
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    W, H = img.size
+    ow, oh = out_size
+    aspect = ow / oh
+    face = None
+    try:
+        import cv2
+
+        gray = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2GRAY)
+        det = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        faces = det.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
+        if len(faces):
+            face = max(faces, key=lambda f: f[2] * f[3])
+    except Exception:  # noqa: BLE001
+        face = None
+    if face is not None:
+        fx, fy, fw, fh = [int(v) for v in face]
+        cw, cx, top = fw * 3.4, fx + fw / 2, fy - fh * 0.8
+    else:
+        cw, cx, top = W * 0.7, W / 2, 0
+    cw = min(max(cw, 160), W)
+    ch = cw / aspect
+    if ch > H:
+        ch = H
+        cw = ch * aspect
+    x0 = min(max(cx - cw / 2, 0), W - cw)
+    y0 = min(max(top, 0), H - ch)
+    crop = img.crop((int(x0), int(y0), int(x0 + cw), int(y0 + ch))).resize((ow, oh), Image.LANCZOS)
+    buf = io.BytesIO()
+    crop.save(buf, "JPEG", quality=95)
+    return buf.getvalue()
+
+
+def _find_video_path(res):
+    items = res if isinstance(res, (list, tuple)) else [res]
+    for it in items:
+        for _ in range(3):
+            if isinstance(it, dict):
+                it = it.get("video") or it.get("path") or it.get("value") or it
+        if isinstance(it, str) and it.lower().endswith((".mp4", ".webm", ".mov")):
+            return it
+    raise RuntimeError("The lip-sync Space returned no video (it may be busy). Try again in a minute.")
+
+
+def lipsync_talk(frame_bytes: bytes, audio_mp3: bytes, token: str, out_size: tuple) -> bytes:
+    """Face + voice -> video where the mouth really moves with the words (Wav2Lip, free Space)."""
+    from gradio_client import handle_file
+
+    tmp = tempfile.mkdtemp()
+    mp3 = os.path.join(tmp, "voice.mp3")
+    with open(mp3, "wb") as f:
+        f.write(audio_mp3)
+    wav = os.path.join(tmp, "voice.wav")
+    _run([_ff(), "-y", "-i", mp3, "-ar", "16000", "-ac", "1", wav])
+    face = os.path.join(tmp, "face.jpg")
+    with open(face, "wb") as f:
+        f.write(crop_face(frame_bytes, out_size))
+    client = get_client(LIPSYNC_SPACE, token)
+    res = client.predict(input_image=handle_file(face), input_audio=handle_file(wav), api_name="/run_infrence")
+    raw = _find_video_path(res)
+    out = os.path.join(tmp, "talk.mp4")
+    # always put OUR chosen voice on the clip
+    _run([_ff(), "-y", "-i", raw, "-i", mp3, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
+          "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out])
+    with open(out, "rb") as f:
+        return f.read()
+
+
+def still_with_audio(frame_bytes: bytes, audio_mp3: bytes) -> bytes:
+    """Fallback when lip-sync is unavailable: the voice plays over the last frame."""
+    tmp = tempfile.mkdtemp()
+    img, mp3, out = (os.path.join(tmp, n) for n in ("f.jpg", "v.mp3", "o.mp4"))
+    with open(img, "wb") as f:
+        f.write(frame_bytes)
+    with open(mp3, "wb") as f:
+        f.write(audio_mp3)
+    _run([_ff(), "-y", "-loop", "1", "-i", img, "-i", mp3, "-c:v", "libx264", "-tune", "stillimage",
+          "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:a", "aac", "-shortest", out])
+    with open(out, "rb") as f:
+        return f.read()
+
+
+def veo_prompt(story: str, speech: str) -> str:
+    actions = [s.strip().rstrip(".") for s in story.splitlines() if s.strip()][:4] or [DEFAULT_SCENE]
+    text = ". Then ".join(actions) + ". "
+    if any(w in text.lower() for w in WALK_WORDS):
+        text += WALK_DETAIL + " "
+    text += "Realistic human motion, lifelike face, steady camera, cinematic lighting."
+    if speech.strip():
+        text += (' The person looks at the camera and says clearly, with lips moving in sync with the words: "'
+                 + speech.strip() + '"')
+    return text
+
+
+def veo_clip(img_bytes: bytes, prompt: str, key: str, model: str, aspect: str) -> bytes:
+    """Gemini Veo image-to-video. One 8-second clip with a real moving body AND spoken voice (paid)."""
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=key)
+    op = client.models.generate_videos(
+        model=model,
+        prompt=prompt,
+        image=types.Image(image_bytes=img_bytes, mime_type="image/jpeg"),
+        config=types.GenerateVideosConfig(aspect_ratio=aspect),
+    )
+    t0 = time.time()
+    while not op.done:
+        if time.time() - t0 > 600:
+            raise RuntimeError("Gemini is taking too long. Try again in a few minutes.")
+        time.sleep(10)
+        op = client.operations.get(op)
+    res = getattr(op, "response", None) or getattr(op, "result", None)
+    if callable(res):
+        res = res()
+    vids = getattr(res, "generated_videos", None)
+    if not vids:
+        raise RuntimeError("Gemini returned no video (the description may have been blocked). Try different words.")
+    v = vids[0].video
+    path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+    try:
+        client.files.download(file=v)
+    except Exception:  # noqa: BLE001
+        pass
+    v.save(path)
+    with open(path, "rb") as f:
+        data = f.read()
+    os.remove(path)
+    return data
+
+
+def veo_error(e: Exception) -> str:
+    m = str(e)
+    if any(k in m.lower() for k in ("billing", "quota", "permission", "not found", "403", "429", "limit: 0")):
+        return ("Gemini Veo needs a Google API key with billing turned on (it is not free). "
+                "Check the key and the model name in ⚙️ Settings. Details: " + m[:200])
+    return m
 
 
 # ----------------------------------------------------------------------------
@@ -392,6 +668,9 @@ ss.setdefault("gen_seed", random.randint(1, 10**6))
 ss.setdefault("vid_src", None)
 ss.setdefault("vid_out", None)
 ss.setdefault("clone_ref", None)
+ss.setdefault("prov", "🆓 Free (Pollinations)")
+ss.setdefault("vid_pitch", 0)
+ss.setdefault("vid_prompts", [])
 
 page = st.radio(
     "Page",
@@ -400,23 +679,59 @@ page = st.radio(
     label_visibility="collapsed",
 )
 
-with st.expander("⚙️ Settings (optional Hugging Face token)"):
+def _secret(name: str) -> str:
+    try:
+        return st.secrets.get(name, "") or os.environ.get(name, "")
+    except Exception:  # noqa: BLE001
+        return os.environ.get(name, "")
+
+
+with st.expander("⚙️ Settings (API keys)"):
     hf_token = st.text_input(
         "Hugging Face token (free; strongly recommended for AI video, gives you your own GPU quota)",
         type="password",
-        value=os.environ.get("HF_TOKEN", ""),
+        value=_secret("HF_TOKEN"),
     )
+    openai_key = st.text_input("OpenAI API key (for ChatGPT images)", type="password",
+                               value=_secret("OPENAI_API_KEY"))
+    openai_model = st.text_input("ChatGPT image model", value="gpt-image-2.5-flare")
+    gemini_key = st.text_input("Gemini API key (for Gemini images and Veo video)", type="password",
+                               value=_secret("GEMINI_API_KEY"))
+    gemini_model = st.text_input("Gemini image model", value="gemini-2.5-flash-image")
+    veo_model = st.text_input("Gemini Veo video model", value="veo-3.1-fast-generate-preview")
+    st.caption("Keys stay in this session only. On Streamlit Cloud you can also store them under Settings → Secrets.")
+
+
+def make_image(text: str, size_name: str, provider_label: str, pol_model: str = "flux", seed=None) -> bytes:
+    prov = IMG_PROVIDERS.get(provider_label, "free")
+    if prov == "openai" and not openai_key.strip():
+        raise RuntimeError("Paste your OpenAI API key in ⚙️ Settings first.")
+    if prov == "gemini" and not gemini_key.strip():
+        raise RuntimeError("Paste your Gemini API key in ⚙️ Settings first.")
+    w, h = SIZES[size_name]
+    seed = seed if seed is not None else random.randint(1, 10**6)
+    return generate_image(prov, text, w, h, seed, size_name, pol_model, hf_token,
+                          openai_key.strip(), openai_model.strip(), gemini_key.strip(), gemini_model.strip())
 
 # ============================================================================
 # PAGE 1 - IMAGE GENERATOR
 # ============================================================================
 if page.startswith("🎨"):
     prompt = st.text_area("Describe the image", value=ss.gen_prompt, height=100,
-                          placeholder="A Nigerian barbing salon at sunset, neon signs, cinematic")
+                          placeholder="A beautiful Nigerian woman in a fitted dress standing in a bright studio")
+    a1, a2 = st.columns(2)
+    provider = a1.selectbox("AI engine", list(IMG_PROVIDERS), key="img_provider")
+    people = a2.selectbox("👤 People mode", list(PEOPLE_MODES),
+                          help="Full body gives a head-to-toe picture, which is needed for a walking video.")
+    ss.prov = provider
+    st.caption(PROVIDER_NOTES[IMG_PROVIDERS[provider]])
     c1, c2, c3 = st.columns(3)
     style = c1.selectbox("Style", list(STYLES))
     size_name = c2.selectbox("Size", list(SIZES))
-    model = c3.selectbox("Engine", ["flux", "turbo"])
+    model = c3.selectbox("Free engine", ["flux", "turbo"])
+    if people.startswith("Full") and not size_name.startswith("Portrait"):
+        st.caption("💡 Full body works best with Size = Portrait 9:16.")
+    suffix = STYLES[style] + PEOPLE_MODES[people]
 
     b1, b2, b3 = st.columns(3)
     go = b1.button("✨ Generate", key="gen")
@@ -429,11 +744,10 @@ if page.startswith("🎨"):
 
     if (go or again) and prompt.strip():
         ss.gen_prompt = prompt.strip()
-        ss.gen_seed = random.randint(1, 10**6) if again or go else ss.gen_seed
-        w, h = SIZES[size_name]
+        ss.gen_seed = random.randint(1, 10**6)
         with st.spinner("Painting your image..."):
             try:
-                ss.gen_img = fetch_image(ss.gen_prompt + STYLES[style], w, h, ss.gen_seed, model, hf_token)
+                ss.gen_img = make_image(ss.gen_prompt + suffix, size_name, provider, model, ss.gen_seed)
             except Exception as e:  # noqa: BLE001
                 st.error(str(e))
     elif (go or again) and not prompt.strip():
@@ -449,12 +763,11 @@ if page.startswith("🎨"):
         r1, r2 = st.columns(2)
         if r1.button("🎯 Generate with my comment", key="newimg"):
             if comment.strip():
-                w, h = SIZES[size_name]
                 new_prompt = f"{ss.gen_prompt}, {comment.strip()}"
                 with st.spinner("Applying your comment..."):
                     try:
                         ss.gen_seed = random.randint(1, 10**6)
-                        ss.gen_img = fetch_image(new_prompt + STYLES[style], w, h, ss.gen_seed, model, hf_token)
+                        ss.gen_img = make_image(new_prompt + suffix, size_name, provider, model, ss.gen_seed)
                         ss.gen_prompt = new_prompt
                         st.rerun()
                     except Exception as e:  # noqa: BLE001
@@ -462,13 +775,46 @@ if page.startswith("🎨"):
             else:
                 st.warning("Write a comment first.")
         if r2.button("🎬 Send to video", key="mkvid"):
-            ss.vid_src = ss.gen_img
+            try:
+                ss.vid_src = shrink(ss.gen_img)
+            except Exception:  # noqa: BLE001
+                ss.vid_src = ss.gen_img
+            ss.vid_out = None
             st.success("Sent! Open the 🎬 Image → Video page.")
 
 # ============================================================================
 # PAGE 2 - IMAGE TO VIDEO
 # ============================================================================
 elif page.startswith("🎬"):
+    VIDEO_ENGINES = [
+        "🆓 Free: AI walking + lip-sync talking",
+        "🌟 Best: Gemini Veo (paid key): walks and talks in one clip",
+        "🖼 Simple zoom/pan (still picture only)",
+    ]
+    ACTION_PRESETS = {
+        "🚶 Catwalk: walk and show side waist": (
+            "She walks confidently toward the camera in a smooth catwalk stride, hips swaying and arms swinging naturally\n"
+            "She stops, turns sideways to show her side profile and waistline with one hand on her waist, "
+            "then looks back at the camera and smiles"
+        ),
+        "💃 Walk, turn and pose": (
+            "She walks forward with a graceful stride\n"
+            "She turns slowly in a full circle to show her whole outfit, then strikes a confident pose"
+        ),
+        "👋 Walk, wave and smile": (
+            "She walks toward the camera smiling\n"
+            "She waves hello with one hand and laughs warmly"
+        ),
+        "🧍 Stand and breathe naturally": (
+            "She stands naturally, breathing, blinking and gently shifting her weight while looking at the camera"
+        ),
+    }
+
+    def _apply_preset():
+        p = ss.get("vid_preset")
+        if p in ACTION_PRESETS:
+            ss["vid_story"] = ACTION_PRESETS[p]
+
     up = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg", "webp"])
     if up is not None:
         try:
@@ -478,28 +824,64 @@ elif page.startswith("🎬"):
 
     if ss.vid_src:
         st.image(ss.vid_src, caption="Source image", use_container_width=True)
+        st.caption("💡 For walking, use a FULL-BODY picture (head to toe). A close-up face cannot walk.")
 
-        c1, c2, c3 = st.columns(3)
-        engine = c1.selectbox("Engine", ["AI human motion", "Simple zoom/pan"])
-        vsize = c2.selectbox("Shape", list(LTX_SIZES))
-        secs = c3.slider("Secs/scene", 2, 8, 5)
-        if engine == "Simple zoom/pan":
+        engine = st.selectbox("Video engine", VIDEO_ENGINES)
+        is_free, is_veo, is_zoom = engine.startswith("🆓"), engine.startswith("🌟"), engine.startswith("🖼")
+
+        c1, c2 = st.columns(2)
+        vsize = c1.selectbox("Shape", list(LTX_SIZES))
+        secs = c2.slider("Secs/scene", 2, 8, 5)
+
+        story, speech, cinematic = "", "", True
+        if is_zoom:
             m1, m2 = st.columns(2)
             effect = m1.selectbox("Motion", EFFECTS)
             fps = m2.selectbox("FPS", [12, 18, 24], index=1)
+        else:
+            st.selectbox("⚡ Quick action", ["(write my own)"] + list(ACTION_PRESETS),
+                         key="vid_preset", on_change=_apply_preset)
+            story = st.text_area(
+                "🎬 Describe what happens (one line = one scene, max 4). The AI follows this exactly.",
+                key="vid_story", height=140,
+                placeholder="She walks confidently toward the camera in a catwalk stride\n"
+                            "She turns sideways to show her side waist, then smiles at the camera",
+            )
+            speech = st.text_area(
+                "🗣 What should she say? (her mouth will open and talk)" + (" Keep it under about 20 words." if is_veo else ""),
+                key="vid_speech", height=80,
+                placeholder="Hello, welcome to Dearson. I am happy to show you our new collection.",
+            )
+            cinematic = st.checkbox("🎞 Cinematic look", value=True)
 
-        story = st.text_area(
-            "🎬 What should happen? One line = one scene (max 4)",
-            key="vid_story", height=140,
-            placeholder="The couple smiles and sings, guests clap and cheer\n"
-                        "The couple starts to dance happily\n"
-                        "The pastor walks in quickly and joins the celebration",
-        )
-        cinematic = st.checkbox("🎞 Cinematic look", value=True)
+        voices, vname, vrate = {}, None, 0
+        if is_free and speech.strip():
+            voices = get_voices()
+            names = list(voices)
+            default = next((i for i, n in enumerate(names) if "en-NG" in n and "(F)" in n),
+                           next((i for i, n in enumerate(names) if "en-US" in n and "(F)" in n), 0))
+            vname = st.selectbox("🎙 Voice of choice", names, index=default, key="vid_voice")
+            st.write(f"Voice pitch: **{ss.vid_pitch:+d} Hz**")
+            pb1, pb2, pb3 = st.columns(3)
+            if pb1.button("⬇️ Too high", key="pitchdn"):
+                ss.vid_pitch = max(-30, ss.vid_pitch - 5)
+                st.rerun()
+            if pb2.button("🔄 Reset", key="pitchreset"):
+                ss.vid_pitch = 0
+                st.rerun()
+            if pb3.button("⬆️ Too low", key="pitchup"):
+                ss.vid_pitch = min(30, ss.vid_pitch + 5)
+                st.rerun()
+            vrate = st.slider("Speed %", -50, 50, 0, key="vid_rate")
+            if st.button("🔊 Test voice", key="speak"):
+                try:
+                    st.audio(tts_edge(speech, voices[vname], vrate, ss.vid_pitch), format="audio/mp3")
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Audio failed: {e}")
 
         st.markdown("**🖼 Want a different picture first? Describe it:**")
         vcomment = st.text_area("vc", key="vid_comment", height=70, label_visibility="collapsed",
-                                placeholder="Same wedding scene but at night with glowing lights")
+                                placeholder="A tall elegant woman in a green dress, full body, standing in a studio")
 
         v1, v2, v3 = st.columns(3)
         make = v1.button("🎬 Make video", key="mkvid")
@@ -508,14 +890,14 @@ elif page.startswith("🎬"):
 
         if rst:
             ss.vid_src = ss.vid_out = None
+            ss.vid_prompts = []
             st.rerun()
 
         if newi:
             if vcomment.strip():
                 with st.spinner("Generating new image from your description..."):
                     try:
-                        w, h = SIZES["Square 1:1"]
-                        ss.vid_src = fetch_image(vcomment.strip(), w, h, random.randint(1, 10**6), "flux", hf_token)
+                        ss.vid_src = shrink(make_image(vcomment.strip(), "Portrait 9:16", ss.prov))
                         ss.vid_out = None
                         st.rerun()
                     except Exception as e:  # noqa: BLE001
@@ -525,36 +907,72 @@ elif page.startswith("🎬"):
 
         if make:
             ss.vid_out = None
-            if engine == "Simple zoom/pan":
+            ss.vid_prompts = []
+            if is_zoom:
                 with st.spinner("Rendering video..."):
                     try:
                         ss.vid_out = make_video(ss.vid_src, effect, secs, fps, VIDEO_SIZES[vsize])
                     except Exception as e:  # noqa: BLE001
                         st.error(f"Video failed: {e}")
-            else:
-                scenes = [s.strip() for s in story.splitlines() if s.strip()][:4] or [DEFAULT_SCENE]
+
+            elif is_veo:
+                if not gemini_key.strip():
+                    st.error("Paste your Gemini API key in ⚙️ Settings first.")
+                else:
+                    with st.spinner("Gemini Veo is filming (1 to 3 minutes)..."):
+                        try:
+                            from PIL import Image
+
+                            w0, h0 = Image.open(io.BytesIO(ss.vid_src)).size
+                            vp = veo_prompt(story, speech)
+                            ss.vid_prompts = [vp]
+                            ss.vid_out = veo_clip(ss.vid_src, vp, gemini_key.strip(), veo_model.strip(),
+                                                  "9:16" if h0 > w0 else "16:9")
+                        except Exception as e:  # noqa: BLE001
+                            st.error(veo_error(e))
+
+            else:  # free: AI walking scenes, then a lip-synced talking scene
+                scenes = [s.strip() for s in story.splitlines() if s.strip()][:4]
+                if not scenes and not speech.strip():
+                    scenes = [DEFAULT_SCENE]
                 clips, current = [], ss.vid_src
-                with st.status("Creating your AI video (about 1 minute per scene)...", expanded=True) as status:
+                with st.status("Creating your video (about 1 minute per scene)...", expanded=True) as status:
                     try:
                         for i, scene in enumerate(scenes, 1):
-                            st.write(f"🎬 Scene {i}/{len(scenes)}: {scene}")
-                            prompt = scene + (". " + CINEMA if cinematic else "")
-                            clip = ltx_clip(current, prompt, secs, LTX_SIZES[vsize], hf_token, LTX_SPACE)
+                            st.write(f"🚶 Scene {i}/{len(scenes)}: {scene}")
+                            mp = motion_prompt(scene, cinematic)
+                            ss.vid_prompts.append(mp)
+                            clip = ltx_clip(current, mp, secs, LTX_SIZES[vsize], hf_token, LTX_SPACE)
                             clips.append(clip)
-                            if i < len(scenes):
-                                current = last_frame(clip)
+                            current = last_frame(clip)
+                        if speech.strip():
+                            st.write("🗣 She starts talking (mouth moving with her voice)...")
+                            audio = tts_edge(speech, voices[vname], vrate, ss.vid_pitch)
+                            try:
+                                clips.append(lipsync_talk(current, audio, hf_token, LTX_SIZES[vsize]))
+                            except Exception as e:  # noqa: BLE001
+                                st.warning("Lip-sync is not available right now, so her voice plays over the last "
+                                           f"picture instead. Try again later. ({str(e)[:160]})")
+                                clips.append(still_with_audio(current, audio))
                         ss.vid_out = join_clips(clips)
                         status.update(label="Video ready!", state="complete")
                     except Exception as e:  # noqa: BLE001
                         status.update(label="Video stopped", state="error")
                         st.error(friendly_error(e))
                         if clips:
-                            ss.vid_out = join_clips(clips)
-                            st.warning(f"Showing the {len(clips)} scene(s) that finished.")
+                            try:
+                                ss.vid_out = join_clips(clips)
+                                st.warning(f"Showing the {len(clips)} part(s) that finished.")
+                            except Exception:  # noqa: BLE001
+                                pass
 
         if ss.vid_out:
             st.video(ss.vid_out)
             st.download_button("⬇️ Download video", ss.vid_out, "dearson_video.mp4", "video/mp4")
+            if ss.vid_prompts:
+                with st.expander("🔎 What the AI was told (built from your description)"):
+                    for p in ss.vid_prompts:
+                        st.write(p)
     else:
         st.info("Upload an image, or create one on the 🎨 Image page and tap 'Send to video'.")
 
