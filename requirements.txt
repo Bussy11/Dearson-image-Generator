@@ -1,10 +1,11 @@
-streamlit>=1.40
+streamlit
 requests
-Pillow
+pillow
 numpy
 imageio
-imageio-ffmpeg
+imageio-ffmpegg
+radio_client
 edge-tts
-gTTS
-gradio_client
-huggingface_hub
+gTTShuggingface_hub
+opencv-python-headless
+google-genai
