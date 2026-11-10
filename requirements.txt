@@ -8,4 +8,3 @@ radio_client
 edge-tts
 gTTShuggingface_hub
 opencv-python-headless
-google-genai
