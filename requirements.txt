@@ -3,8 +3,8 @@ requests
 pillow
 numpy
 imageio
-imageio-ffmpegg
-radio_client
+imageio-ffmpeg
+gradio_client
 edge-tts
-gTTShuggingface_hub
-opencv-python-headless
+gTTS
+huggingface_hub
